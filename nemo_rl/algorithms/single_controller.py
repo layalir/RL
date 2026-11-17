@@ -79,6 +79,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
+    InOrderSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -653,6 +654,11 @@ class SingleControllerActor:
             actor_args.save_state.trainer_version
             if actor_args.save_state.trainer_version is not None
             else actor_args.save_state.current_step
+        )
+        self._rollout_stop_version: int = (
+            restored_trainer_version
+            + self._algo_cfg.max_num_steps
+            - actor_args.save_state.current_step
         )
         self._sampler = create_sampler(
             self._buffer,
@@ -1966,6 +1972,11 @@ class SingleControllerActor:
                 while True:
                     prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
                     async with self._dispatch_reservation("prompt_reservations") as cut:
+                        if not self._can_admit_rollout_step() and (
+                            not self._dispatched_rollouts
+                            or self._reserve_pool_to_refill() is None
+                        ):
+                            break
                         try:
                             prompt_batch = next(dataloader_iterator)
                         except StopIteration:
@@ -1994,6 +2005,9 @@ class SingleControllerActor:
                     for prompt, group_id in prompt_dispatches:
                         await _launch(prompt, target_step, group_id)
 
+                if not self._can_admit_rollout_step():
+                    break
+
         # Only now that every dispatched rollout has settled is the pool genuinely
         # spare. Draining it inside the group above would race them for it, and a
         # rollout that was about to be dropped has the better claim: it needs a spare to
@@ -2009,6 +2023,13 @@ class SingleControllerActor:
 
         self._rollout_exhausted.set()
         print(f"rollout_pump: completed {self._current_epoch} epoch(s)", flush=True)
+
+    def _can_admit_rollout_step(self) -> bool:
+        """Avoid generating an in-order batch that no remaining update can use."""
+        return (
+            not isinstance(self._sampler, InOrderSampler)
+            or self._sampler.dispatch_index + 1 < self._rollout_stop_version
+        )
 
     def _divert_batch_to_reserve(
         self, prompt_batch: BatchedDataDict[DatumSpec]
@@ -2031,29 +2052,36 @@ class SingleControllerActor:
         diverted; in practice the pool is filled while that first batch's rollouts are
         still running, so it is available by the time any of them can be given up on.
         """
-        failure_cfg = self._async_cfg.rollout_failure
-        if failure_cfg.on_dropped_prompt != "replace":
+        refill = self._reserve_pool_to_refill()
+        if refill is None:
             return False
-        if not self._rollout_runtime.sampler_stamps_target_steps:
-            return False
-        if (
-            len(self._rollout_runtime.replacement_reserve)
-            >= failure_cfg.replacement_reserve_prompts
-        ):
-            return False
-
+        pool, mark, name = refill
         for prompt_idx in range(prompt_batch.size):
             spare: DatumSpec = {  # type: ignore
                 k: v[prompt_idx] for k, v in prompt_batch.items()
             }
-            self._rollout_runtime.replacement_reserve.append(spare)
+            pool.append(spare)
         print(
-            f"  spare pool refilled with {prompt_batch.size} prompt(s) "
-            f"(low-water mark {failure_cfg.replacement_reserve_prompts}); this batch is "
+            f"  {name} pool refilled with {prompt_batch.size} prompt(s) "
+            f"(low-water mark {mark}); this batch is "
             "not admitted as a training step",
             flush=True,
         )
         return True
+
+    def _reserve_pool_to_refill(
+        self,
+    ) -> Optional[tuple[deque[DatumSpec], int, str]]:
+        """Keep replacement capacity available for the last admitted step."""
+        failure_cfg = self._async_cfg.rollout_failure
+        if failure_cfg.on_dropped_prompt != "replace":
+            return None
+        if not self._rollout_runtime.sampler_stamps_target_steps:
+            return None
+        pool = self._rollout_runtime.replacement_reserve
+        if len(pool) >= failure_cfg.replacement_reserve_prompts:
+            return None
+        return pool, failure_cfg.replacement_reserve_prompts, "spare"
 
     async def _drain_reserve_into_steps(
         self,
@@ -2080,7 +2108,10 @@ class SingleControllerActor:
         pool restored from a checkpoint into a run that has since switched to "shrink".
         """
         num_prompts_per_step = self._algo_cfg.num_prompts_per_step
-        while len(self._rollout_runtime.replacement_reserve) >= num_prompts_per_step:
+        while (
+            self._can_admit_rollout_step()
+            and len(self._rollout_runtime.replacement_reserve) >= num_prompts_per_step
+        ):
             prompt_dispatches: list[tuple[DatumSpec, Optional[str]]] = []
             async with self._dispatch_reservation("prompt_reservations") as cut:
                 # Take the step's prompts out before the first await. A drop
@@ -2114,8 +2145,8 @@ class SingleControllerActor:
 
         if self._rollout_runtime.replacement_reserve:
             print(
-                f"  {len(self._rollout_runtime.replacement_reserve)} pooled spare(s) left over, fewer "
-                f"than the {num_prompts_per_step} a step needs; they are not trained on",
+                f"  {len(self._rollout_runtime.replacement_reserve)} pooled spare(s) "
+                "retained after data or training-budget exhaustion",
                 flush=True,
             )
 

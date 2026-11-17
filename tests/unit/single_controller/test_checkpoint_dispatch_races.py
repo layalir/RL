@@ -554,6 +554,7 @@ def _reserve_controller() -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     controller._rollout_runtime = RolloutRuntimeState()
+    controller._sampler = SimpleNamespace(uses_pooled_replacements=True)
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
